@@ -10,37 +10,31 @@
 // or submit itself to any jurisdiction.
 
 /// \file jetLundPlane.cxx
-/// \brief Task for jet Lund plane. Creates histograms for offline unfolding (including QA histos), and optionally tables.
+/// \brief Task for jet Lund plane. Creates histograms for offline unfolding (including QA histos), and optionally tables, including an inclusive splitting MiniAOD table.
 /// \author Zoltan Varga <zoltan.varga@cern.ch>
 
+#include "PWGJE/Core/FastJetUtilities.h"
 #include "PWGJE/Core/JetFinder.h"
 #include "PWGJE/DataModel/Jet.h"
 #include "PWGJE/DataModel/JetReducedData.h"
 
 #include "Common/Core/RecoDecay.h"
 
-#include <CommonConstants/MathConstants.h>
-#include <CommonConstants/PhysicsConstants.h>
-#include <Framework/AnalysisDataModel.h>
-#include <Framework/AnalysisHelpers.h>
-#include <Framework/AnalysisTask.h>
-#include <Framework/Configurable.h>
-#include <Framework/HistogramRegistry.h>
-#include <Framework/HistogramSpec.h>
-#include <Framework/InitContext.h>
-#include <Framework/runDataProcessing.h>
+#include "CommonConstants/MathConstants.h"
+#include "CommonConstants/PhysicsConstants.h"
+#include "Framework/AnalysisDataModel.h"
+#include "Framework/AnalysisTask.h"
+#include "Framework/HistogramRegistry.h"
+#include "Framework/runDataProcessing.h"
 
 #include <THnSparse.h>
 
-#include <fastjet/AreaDefinition.hh>
 #include <fastjet/ClusterSequenceArea.hh>
-#include <fastjet/JetDefinition.hh>
 #include <fastjet/PseudoJet.hh>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <cstddef>
-#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -59,7 +53,7 @@ DECLARE_SOA_TABLE(MiniCollisions, "AOD", "MINICOLL",
                   MiniCollTag);
 
 // MiniJets -> MiniCollisions
-DECLARE_SOA_INDEX_COLUMN_CUSTOM(MiniCollision, miniCollision, "MINICOLLS");
+DECLARE_SOA_INDEX_COLUMN(MiniCollision, miniCollision);
 
 // Jet payload
 DECLARE_SOA_COLUMN(Level, level, uint8_t);     // JetLevel::Det=reco(det), JetLevel::Part=truth(part)
@@ -85,6 +79,10 @@ DECLARE_SOA_COLUMN(SoftPhi, softPhi, float);
 DECLARE_SOA_TABLE(MiniSplittings, "AOD", "MINISPL",
                   MiniJetId, SplitId, DeltaR, PtSoft, PtHard, SoftEta, SoftPhi, JetPt);
 
+// Inclusive splittings for all accepted jets (det or part), independent of matching
+DECLARE_SOA_TABLE(MiniSplittingsAll, "AOD", "MINISPLA",
+                  MiniJetId, SplitId, DeltaR, PtSoft, PtHard, SoftEta, SoftPhi, JetPt);
+
 // Jet-jet matching (MC)
 DECLARE_SOA_COLUMN(MatchDR, matchDR, float);
 DECLARE_SOA_COLUMN(MatchRelPt, matchRelPt, float);
@@ -102,9 +100,6 @@ DECLARE_SOA_TABLE(MiniJetMatches, "AOD", "MINIMCH",
 namespace
 {
 constexpr float kTiny = 1e-12f;
-constexpr uint64_t collisionKeyShift = 1ULL;
-constexpr uint64_t partCollisionKeyTag = 1ULL;
-constexpr size_t MinConstituentsForJet = 2;
 
 struct JetLevel {
   enum Type : uint8_t {
@@ -293,6 +288,7 @@ struct JetLundPlaneUnfolding {
   Produces<aod::MiniCollisions> outMiniCollisions;
   Produces<aod::MiniJets> outMiniJets;
   Produces<aod::MiniSplittings> outMiniSplittings;
+  Produces<aod::MiniSplittingsAll> outMiniSplittingsAll;
   Produces<aod::MiniJetMatches> outMiniJetMatches;
 
   // FastJet reclustering setup (C/A)
@@ -425,7 +421,7 @@ struct JetLundPlaneUnfolding {
   std::vector<SplittingObs> getPrimarySplittings(JetRowT const& jet, ConstituentTableT const&)
   {
     auto fjInputs = buildFastJetInputs(jet.template tracks_as<ConstituentTableT>(), trackPtMin.value);
-    if (fjInputs.size() < MinConstituentsForJet) {
+    if (fjInputs.size() < 2) {
       return {};
     }
 
@@ -542,6 +538,11 @@ struct JetLundPlaneUnfolding {
         for (auto const& s : spl) {
           outMiniSplittings(miniJetIdx, sid++, s.deltaR, s.ptSoft, s.ptHard, s.softEta, s.softPhi, jet.pt());
         }
+
+        uint16_t sidAll = 0;
+        for (auto const& s : spl) {
+          outMiniSplittingsAll(miniJetIdx, sidAll++, s.deltaR, s.ptSoft, s.ptHard, s.softEta, s.softPhi, jet.pt());
+        }
       }
     }
   }
@@ -592,8 +593,7 @@ struct JetLundPlaneUnfolding {
       fillSplittingQAHists(spl, /*isTruth*/ true, partJet.pt());
 
       if (writeMiniAOD.value) {
-        const uint64_t partCollKey =
-          (static_cast<uint64_t>(partJet.mcCollisionId()) << collisionKeyShift) | partCollisionKeyTag;
+        const uint64_t partCollKey = (static_cast<uint64_t>(partJet.mcCollisionId()) << 1U) | 1ULL;
         int partMiniCollIdx = -1;
         auto collIt = partMiniCollByKey.find(partCollKey);
         if (collIt == partMiniCollByKey.end()) {
@@ -606,6 +606,11 @@ struct JetLundPlaneUnfolding {
 
         outMiniJets(partMiniCollIdx, /*level*/ JetLevel::Part, partJet.r(), partJet.pt(), partJet.eta(), partJet.phi());
         partJetToMiniJetIdx[truthJetKey] = outMiniJets.lastIndex();
+
+        uint16_t sidAll = 0;
+        for (auto const& s : spl) {
+          outMiniSplittingsAll(partJetToMiniJetIdx[truthJetKey], sidAll++, s.deltaR, s.ptSoft, s.ptHard, s.softEta, s.softPhi, partJet.pt());
+        }
       }
 
       if (!partJet.has_matchedJetGeo()) {
@@ -660,8 +665,7 @@ struct JetLundPlaneUnfolding {
       fillSplittingQAHists(detSpl, /*isTruth*/ false, detJet.pt());
 
       if (writeMiniAOD.value) {
-        const uint64_t detCollKey =
-          (static_cast<uint64_t>(detJet.collisionId()) << collisionKeyShift);
+        const uint64_t detCollKey = (static_cast<uint64_t>(detJet.collisionId()) << 1U);
         int detMiniCollIdx = -1;
         auto collIt = detMiniCollByKey.find(detCollKey);
         if (collIt == detMiniCollByKey.end()) {
@@ -674,6 +678,11 @@ struct JetLundPlaneUnfolding {
 
         outMiniJets(detMiniCollIdx, /*level*/ JetLevel::Det, detJet.r(), detJet.pt(), detJet.eta(), detJet.phi());
         detJetToMiniJetIdx[detJetKey] = outMiniJets.lastIndex();
+
+        uint16_t sidAll = 0;
+        for (auto const& s : detSpl) {
+          outMiniSplittingsAll(detJetToMiniJetIdx[detJetKey], sidAll++, s.deltaR, s.ptSoft, s.ptHard, s.softEta, s.softPhi, detJet.pt());
+        }
       }
 
       if (!detJet.has_matchedJetGeo()) {
@@ -806,5 +815,5 @@ struct JetLundPlaneUnfolding {
 WorkflowSpec defineDataProcessing(ConfigContext const& cfgc)
 {
   return WorkflowSpec{
-    adaptAnalysisTask<JetLundPlaneUnfolding>(cfgc)};
+    adaptAnalysisTask<JetLundPlaneUnfolding>(cfgc, TaskName{"jet-lund-plane"})};
 }
